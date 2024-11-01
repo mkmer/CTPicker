@@ -1,0 +1,419 @@
+#!/usr/bin/python3
+import os
+import time
+from settings import login, connection
+import subprocess
+import os
+import logging
+from pyftdi.gpio import GpioMpsseController
+from pyftdi.gpio import GpioException
+from pyftdi.usbtools import UsbToolsError, UsbTools
+from pyftdi.ftdi import FtdiError, USBError
+from logme import logme
+
+from asterisk.ami import AMIClient, AutoReconnect, Action, Timer, ctpicker
+
+#Set up logging
+
+logger = logging.getLogger("CTPicker") #__name__ is good for modules
+logging.basicConfig(format='%(asctime)s %(message)s',filename="/temp/python.txt",level=logging.DEBUG)
+
+#----------------Subroutines --------------------
+# Fetch Temp Probe
+def tempprobe(i): #program calls script to read USB Temp Probe.
+	subprocess.call(f"/usr/local/bin/grabtemp{i}.sh")
+	return
+
+#-------------------- end of Subroutines---------
+
+# Main program starts here
+logme("I'm starting up")
+
+#Configuration: CT's
+CW = {
+    0: "/usr/local/bin/voter/tones/morse/ml",
+    1: "/usr/local/bin/voter/tones/morse/cl",
+    2: "/usr/local/bin/voter/tones/morse/ll",
+    3: "/usr/local/bin/voter/tones/morse/dl",
+    4: "/usr/local/bin/voter/tones/morse/cl",
+    5: "/usr/local/bin/voter/tones/morse/sl",	
+    6: "/usr/local/bin/voter/tones/morse/sl",
+    7: "/usr/local/bin/voter/tones/morse/sl",
+    8: "/usr/local/bin/voter/tones/morse/el",
+    9: "/usr/local/bin/voter/tones/morse/xl",
+    10: "/usr/local/bin/voter/tones/morse/rl",
+}
+
+#Friend nodes - looks at the first 5 characters or up to the length (say 298730 - it will match 298730)
+# or 29783 - will match 29783x 29783xx 29783xxx and so on
+FRIENDS = {
+        '57292': "/usr/local/bin/voter/tones/morse/fl",
+        '29096': "/usr/local/bin/voter/tones/morse/fl",
+        '28789': "/usr/local/bin/voter/tones/morse/fl", 
+        '29873': "/usr/local/bin/voter/tones/morse/sl",
+                        
+}
+KERCHUNK = "/var/lib/asterisk/sounds/kerchunk"
+# CHANGE NODE NUMBER TO YOURS BELOW!
+NODE="29972"
+
+# Define the logfile name
+LOGFILE="/temp/scriptlogs.log"
+
+#Define Channel Names and State Names
+# Prefix
+PNX="Receiver"
+portname=[
+    f"Moline {PNX}",	#Port D0
+    f"Cedar {PNX}",	#Port D1
+    f"Lowell {PNX}",	#Port D2
+    f"Grandview {PNX}",#Port D3
+    f"Site 8 {PNX}",	#Port D4
+    f"Site 7 {PNX}",	#Port D5
+    f"Site 6 {PNX}",	#Port D6
+    f"site 5 {PNX}",	#Port D7
+    "No Data",	#Port D8
+]
+# Choose how long we delay between checking voted sites 
+INTERSITEDELAYTIME = .15
+
+#---------------------------------- Change settings above this line ONLY ---------------------------------------------
+#---------------------------------- Change NOTHING Below here else you might break something. ------------------------
+
+gpio_broke = False
+statename0 = ", On"
+statename1 = ", Off"
+client = AMIClient(**connection) # from settings.py
+#AutoReconnect(ami_client = client) #set up automatic reconnection logic
+TheCTpicker = ctpicker()
+
+client.add_listener(
+    on_connect=TheCTpicker.event_connect,
+    on_disconnect = TheCTpicker.event_disconnect,
+)
+client.add_event_listener( # setup the call back for AMI events - keyup
+    on_event=TheCTpicker.event_notification,
+    )
+
+future = client.login(**login) # from settings.py
+#if future.response.is_error():
+#    logme(f"I can not connect to AMI: {str(future.response)}")
+    #raise Exception(str(future.response))
+
+
+#while not TheCTpicker.connected:
+#    time.sleep(1)
+
+voter = client.send_action(Action('VoterStatus',)) #get voter status and set up arrays for devices
+response = voter.response
+
+#Define Variables
+results=point=trreply=start_time=keyup_time=loglabel=command=Response=cttoneresponse=channelreport=log=cttoneresponse=""
+relay=state=chan9=cttone=chantotal=chan0=chan1=chan2=chan3=chan4=chan5=chan6=chan7=chan8=chanpct0=chanpct1=chanpct2=chanpct3=chanpct4=chanpct5=chanpct6=chanpct7=chanpct8=chanptctotal=0
+InputCommand=''
+output = [False,False,False,False,False,False,False,False]
+input = []
+gpio = GpioMpsseController()
+
+try:
+    gpio.configure('ftdi://ftdi:232h:1/1',direction=65280,frequency=1.0E3) # Changed from 6mhz and all is good? mjk
+except (UsbToolsError, USBError) as ex:
+    gpio_broke = True #couldn't find the 232h device... Keep going without it
+    logger.exception(ex) # Log any uncaught exceptions to the python.txt log file
+
+# Read output "memory" files:
+#----------------------------------------------------------------------------
+for i in range(8):
+    if os.path.exists(f'/temp/output{i+8}_signal'):
+        print(f"output{i} file Exists - Processing")
+        logme(f'Alert!! {portname[i]} is Disabled')
+        output[i] = True
+# Becasue we reset the GPIO module on connection, we need to turn on the ouputs for 
+# inhibited receivers every time we connect.  We should look at how to get around this.
+# mjk
+
+output_int= sum(map(lambda x: x[1] << x[0], enumerate(output))) # convert bool array into int
+
+try:
+    gpio.write(output_int<<8) # shift to high byte for outputs. 
+except (GpioException, USBError):
+    gpio_broke = True #couldn't find the 232h device...keep going without it
+    logme("No GPIO connection at startup.")
+
+#create a timer for each Allstar link voter by voter name
+for voter in [key for key in response.keys if key not in ("ActionID", "Node", "Response")]:
+    TheCTpicker.set_timers(voter, Timer())
+    if int(response.keys[voter].get('RSSI')) > 0:
+        TheCTpicker.get_timers(voter).start()        
+    
+#----------------------------------------- Processing Voter Signals --------------------------------------------------------------
+chan=[Timer() for _ in range(9)] # array of 9 timers
+chanpct = [0 for _ in range(9)] # setup last channel percentages
+last_state = False
+state_change = False
+voter_keyed = False
+voter_keyed_time = time.time()
+
+try:
+    while True and not gpio_broke and TheCTpicker.connected:
+        try: # Let's try reading all the time - see if it fixes GPIO going away.
+        # Turns out the polling rate was to high for the board. 6mhz -> .5mhz and all is good?
+            pins = gpio.read(peek=True) # only read 1st byte
+            gpio_broke = False
+        except (GpioException, USBError) as ex: # we are not connected.
+            pins = 255 #make them all "off" (aka True)
+            if not gpio_broke:
+                logger.exception(ex) # Log any uncaught exceptions to the python.txt log file
+            gpio_broke = True
+           
+
+        #Edge detector
+        if last_state != TheCTpicker.keyed:
+            state_change = True
+        
+        last_state = TheCTpicker.keyed
+        #Keyed up "leading edge"---------------------------------------
+        if state_change and TheCTpicker.keyed:
+            start_time = time.time()
+            
+        if not TheCTpicker.keyed:
+            x = [bool(int(b)) for b in bin(pins)[2:]]
+
+            if voter_keyed and (time.time() - voter_keyed_time) > 2:
+                logme("Not receiving keyup from asl, restarting")
+                exit()
+
+            if x.count(False) > 0 and not voter_keyed: # Hall voter is keyed, ASL voter is not
+               # logme("Voter is keyed, asl is not")
+                voter_keyed = True
+                voter_keyed_time = time.time()
+
+            
+        #Keyed up--------------------------------------------------------------
+        if TheCTpicker.keyed: # Run timers for Allstarlink voters
+            voter_keyed = False
+            # Poll the mixers - accumulate time they are > 0
+            action = Action(
+                'VoterStatus',
+                #ActionID="ctpicker",
+            )
+            
+            voter = client.send_action(action)  # get the AMI voter details
+            response = voter.response 
+
+            for voter in [key for key in response.keys if key not in ("ActionID", "Node", "Response")]:
+                if int(response.keys[voter].get('RSSI')) > 0:
+                    TheCTpicker.get_timers(voter).start()        
+                else:
+                    TheCTpicker.get_timers(voter).stop()  
+                    
+            # we now poll all the time rather than just when keyed - seems to keep device alive?
+            # try:
+            #     pins = gpio.read()#peek=True) # only read 1st byte
+            # except GpioException: # we are not connected.
+            #     pins = 255 #make them all "off"
+            
+            bits = [bool(int(b)) for b in bin(pins)[2:]] #probably could do <<i to find right bit.
+            bits.reverse()
+
+            for i in range(8):# run timers for each active voter channel					
+                try:
+                    if (bits[i] is False):
+                        chan[i].start()
+                    else:
+                        chan[i].stop()
+                except IndexError:
+                    pass    
+        # Unkeyed "falling edge"-------------------------------------------------------------
+        if state_change and not TheCTpicker.keyed:
+
+            chantotal = sum(chan[i].accumulated_time for i in range(8))
+            if chantotal == 0: # divide by zero "fix"
+                chantotal = 1
+
+            # Calculate Total active Time:
+            keyup_time = str(float("{0:.1f}".format((time.time() - start_time))))
+
+            
+            for i in range(8):
+                chanpct[i]=int(round((chan[i].accumulated_time/chantotal)*100))
+
+            channelreport = '' # clear out last channel report
+            for i in range(8):                                         
+                if chanpct[i]>0: 
+                    channelreport=f"{channelreport}{portname[i]} {str(chanpct[i])}%, " 
+            
+            d = {f'{i}':chan[i].accumulated_time for i in range(9)}
+
+            cttone= max(d, key=d.get) #find the index of largest time
+
+            loglabel=portname[int(cttone)] # name the winner
+
+            for i in range(8): # reset the timers
+                chan[i].reset()
+
+            #IF the dgplay.sig file is present, then play the telemetry to the user.
+            if os.path.exists("/temp/dgplay.sig"):
+                os.system(f'/usr/local/bin/speakme_quick "{channelreport}"')
+            
+        #---------------------------- End Voter -----------------
+            cton = False
+            if os.path.exists("/temp/cton.sig"):
+                cton = True
+
+            RX_uptime = f'RX Uptime:{keyup_time} seconds,'
+            match TheCTpicker.last_winner:
+                # if it's moline, look at the I/O values
+                case 'Moline_Mix': 
+
+                    if gpio_broke:
+                        if cton: os.system(f"/usr/sbin/asterisk -rx 'rpt localplay {NODE} {CW.get(9)}'") #index 9 = Broke
+                        gpio_broke = False
+                        logme(f'{RX_uptime} Voted:{loglabel} - Diag: Broke')
+                        
+                    elif channelreport == '' and float(keyup_time) < 1:
+                        if cton: os.system(f"/usr/sbin/asterisk -rx 'rpt localplay {NODE} {KERCHUNK}'") #Too short
+                        logme(f'{RX_uptime} Voted: Kerchunk')
+
+                    elif (x:=next((i for i in range(8) if cttone==f"{i}"),False)) is not False: 
+                        if cton: os.system(f"/usr/sbin/asterisk -rx 'rpt localplay {NODE} {CW.get(x)}'") #Voter Channel
+                        logme(f'{RX_uptime} Voted:{loglabel} - Diag:{channelreport}') 
+
+                case '' : # this is a remote - no allstar link mixer data
+                    node_keyed = TheCTpicker.keyed_node
+                    # use length of node in list to match - find first match in list for friends
+                    if (node:= next((friend_node for friend_node in FRIENDS.keys() if node_keyed[:len(friend_node)] == friend_node),False)):
+                        if cton: os.system(f"/usr/sbin/asterisk -rx 'rpt localplay {NODE} {FRIENDS.get(node)}'")
+                        logme(f'{RX_uptime} Voted: Friend {node}')
+                        found = True
+                    
+                        #Too short - kerchunk
+                    elif node_keyed == ''and float(keyup_time) < 1 :
+                        if cton: os.system(f"/usr/sbin/asterisk -rx 'rpt localplay {NODE} {KERCHUNK}'")
+                        logme(f'{RX_uptime} Voted: Kerchunk')
+
+                    #No other list matches - it's just remote
+                    else:    
+                        if cton: os.system(f"/usr/sbin/asterisk -rx 'rpt localplay {NODE} {CW.get(10)}'")
+                        logme(f'{RX_uptime} Voted: Remote {node_keyed}')
+
+                case _ : # this is a Allstar link mixer - play morse for first letter of the mixer name
+                    sound = f"/usr/local/bin/voter/tones/morse/{TheCTpicker.last_winner[:1].lower()}l" 
+                    if cton: os.system(f"/usr/sbin/asterisk -rx 'rpt localplay {NODE} {sound}'")
+                    logme(f'{RX_uptime} Voted:{TheCTpicker.last_winner}')
+
+        state_change = False
+
+        
+#--------------Process commands----------------------------------------------
+        if os.path.exists('/temp/command'):
+            print("Command file Exists - Processing")
+            with open('/temp/command', 'r') as cmdfile:
+                raw = cmdfile.read()
+                command=str.strip(raw)	
+                logme('Command Received:' +command)
+
+                # ----Commands to Run -----------	
+                # Cabinet Temp:
+                if command[:-1] == "probe":
+                    tempprobe(int(command[-1:])) 
+                    
+                #Voter Channel Control	
+                if command[0:7]=="control" : 
+                        msg= command[8:11]
+                        if msg[0:3].isdigit():       
+                            if (int(msg[:2])<9 or int(msg[:2])>16):
+                                logme("Response: Invalid Output")
+                            #IF the state we want to switch to isn't a 0 or a 1, Let's advise
+                            elif (int(msg[2:3])<0 or int(msg[2:3])>2):
+                                logme("Response: Invalid State")
+                            #Okay. all is well, now lets do some work.  
+                            else:
+                                n=0
+                                trreply=""
+                                relay=int(msg[:2]) -1
+                                n=int(msg[:2])
+                            
+                        if msg[2:3]=="0":
+                            s=0
+                            setstate = statename0
+                            point=f"{relay}0"
+                            output[relay-8] = False
+                            if os.path.exists(f"/temp/output{str(relay)}_signal"):
+                                os.remove(f"/temp/output{str(relay)}_signal")
+
+                        if msg[2:3]=="1":
+                            s=1
+                            setstate = statename1
+                            point=f"{relay}1"
+                            output[relay-8] = True
+                            sigfile = open(f"/temp/output{str(relay)}_signal","a")
+                            sigfile.close	
+
+                        if msg[2:3]=="2":
+                            s=2
+                            
+                            for filename in os.listdir('/temp'):
+                                if filename.endswith(".signal"): 
+                                        logme(filename)
+                                        continue
+                                else:
+                                    continue
+                                
+
+                        # Speak the response to setting the outputs
+                        os.system(f"/usr/sbin/asterisk -rx 'rpt localplay {NODE} /usr/local/bin/voter/tones/{point}'")
+                        
+                        # Write to the Log File
+                        logme(f'Command Received:{command}')
+                        logme(f'Point={point} and output={output_int}')
+                                    
+                #Check Disabled RX	
+                if command[0:7]=="rxstats" : 
+                        print("RXSTATS")
+                        for filename in os.listdir('/temp'):
+                                if filename.endswith(".signal"): 
+                                    print(filename)
+                                    continue
+                                else:
+                            
+                                    continue
+                # If a command was found, always check the files and update the outputs
+                for i in range(8):       
+                    if os.path.exists(f'/temp/output{i+8}_signal'):
+                        print(f"output{i} file Exists - Processing")
+                        logme(f'Alert!! {portname[i]} is Disabled')
+                        output[i] = True
+                    else:
+                        output[i] = False
+
+                output_int= sum(map(lambda x: x[1] << x[0], enumerate(output))) # convert bool array into int
+
+                try:
+                    gpio.write(output_int<<8) # shift to high byte for outputs. 
+                except (GpioException, USBError):
+                    if not gpio_broke:
+                        logger.exception(ex) # Log any uncaught exceptions to the python.txt log file
+                    gpio_broke = True
+                    pass #couldn't find the 232h device...
+
+            os.remove("/temp/command")
+
+        time.sleep(INTERSITEDELAYTIME)
+
+except (KeyboardInterrupt, SystemExit):
+    logme("I've been interrupted.")
+    gpio.close(freeze=True)
+    UsbTools.flush_cache()
+    client.logoff()
+
+except Exception as ex:
+    logme("Check python log")
+    logger.exception(ex) # Log any uncaught exceptions to the python.txt log file
+    try:
+        gpio.close(freeze=True)
+    except:
+        pass
+    UsbTools.flush_cache()
+
+logme("I've exited (maybe disconnected?)")
