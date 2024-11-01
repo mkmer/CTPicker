@@ -2,7 +2,8 @@ A tool to play various sounds based on i/o inputs, RTCM's, and connected nodes v
 
 We run this as a service created in systemd:
 <ctpicker.service>
-[Unit]
+
+```[Unit]
 Description="CTPicker task"
 After=network.target
 
@@ -13,3 +14,4 @@ RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
+```
