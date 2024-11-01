@@ -1,4 +1,7 @@
 A tool to play various sounds based on i/o inputs, RTCM's, and connected nodes via the AMI interface
+requires this API : https://pypi.org/project/asterisk-ami/
+
+`pip install asterisk-ami`
 
 We run this as a service created in systemd:
 <ctpicker.service>
